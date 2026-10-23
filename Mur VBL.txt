@@ -1,0 +1,1275 @@
+if getgenv then
+    local env = getgenv()
+    if env.UxosuimHubLoaded then
+        local sameGame = env.UxosuimHubGame == game
+        local staleLoad = env.UxosuimHubLoaded == "loading"
+            and (os.clock() - (tonumber(env.UxosuimHubLoadT) or 0)) > 45
+        if sameGame and not staleLoad then
+            local lib = env.UxosuimHubLibrary
+            local alive = true
+            if env.UxosuimHubLoaded == true and type(lib) == "table" then
+                alive = lib.ScreenGui ~= nil and lib.ScreenGui.Parent ~= nil
+            end
+            if alive then
+                warn("[UxosuimHub] Already loaded (or still loading). Unload first to reload.")
+                if env.UxosuimHubLoaded == true and type(env.UxosuimHubNotify) == "function" then
+                    pcall(env.UxosuimHubNotify, "Uxosuim Hub is already running - press RightShift for the menu", 8)
+                end
+                return
+            end
+        end
+        env.UxosuimHubLoaded = nil
+        env.UxosuimHubLibrary = nil
+        env.UxosuimHubNotify = nil
+    end
+    env.UxosuimHubGame = game
+    env.UxosuimHubLoadT = os.clock()
+    env.UxosuimHubLoaded = "loading"
+end
+local UxosuimUnloaded = false
+local startSpeedLoop, startAutoSpinLoop, startStreamerLoop
+local syncKeybinds
+local checkPlayerForMod
+
+local HubConns = {}
+local function safeDisconnect(conn)
+    if conn then pcall(function() conn:Disconnect() end) end
+end
+local function hubConn(signal, fn)
+    if not signal or type(fn) ~= "function" then return nil end
+    local ok, conn = pcall(function() return signal:Connect(fn) end)
+    if ok and conn then
+        HubConns[#HubConns + 1] = conn
+        return conn
+    end
+    return nil
+end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local VX = {
+    set = {}, buf = {}, conns = {}, users = {}, on = false,
+    cheapBuf = {}, scanFound = {}, predOwned = {}, predT = 0, seedToken = 0,
+    partCache = {},
+}
+VX.clear = table.clear or function(t)
+    for k in pairs(t) do t[k] = nil end
+end
+function VX.destroy(o) o:Destroy() end
+function VX.disconnect(c) c:Disconnect() end
+function VX.track(v)
+    if not v or not v.Parent then return end
+    local n = v.Name
+    if type(n) == "string" and n:upper():find("BALL", 1, true) then
+        VX.set[v] = true
+    end
+end
+-- Shared active-ball part resolver. All ball-driven features use this exact
+-- path so nested CLIENT_BALL models, PrimaryParts, and client hitbox helpers
+-- cannot make one feature aim at a different physical ball part than another.
+function VX.ballPart(candidate)
+    if not candidate or not candidate.Parent then return nil end
+    if candidate:IsA("BasePart") then
+        return candidate.Name ~= "ExtendedHitbox" and candidate:GetAttribute("UxosuimHitbox") ~= true and candidate or nil
+    end
+    if not candidate:IsA("Model") then return nil end
+    local cached = VX.partCache[candidate]
+    if cached and cached.Parent and cached:IsDescendantOf(candidate)
+        and cached.Name ~= "ExtendedHitbox" and cached:GetAttribute("UxosuimHitbox") ~= true then
+        return cached
+    end
+    -- CLIENT_BALL models can include helper parts, effects, and in some states
+    -- character-adjacent parts. Select the physical ball deliberately instead
+    -- of using the first descendant, which could weld the expander to a wrong
+    -- visual/helper part.
+    local primary, best, bestScore = candidate.PrimaryPart, nil, -math.huge
+    for _, part in ipairs(candidate:GetDescendants()) do
+        if part:IsA("BasePart") and part.Name ~= "ExtendedHitbox" and part:GetAttribute("UxosuimHitbox") ~= true then
+            local owner = part:FindFirstAncestorOfClass("Model")
+            if not (owner and Players:GetPlayerFromCharacter(owner)) then
+                local partName = string.lower(part.Name)
+                local score = 0
+                if partName == "ball" or partName == "client_ball" then
+                    score = score + 1200
+                elseif partName:find("ball", 1, true) then
+                    score = score + 800
+                end
+                if part == primary then score = score + 450 end
+                if part:IsA("Part") and part.Shape == Enum.PartType.Ball then score = score + 300 end
+                local largest = math.max(part.Size.X, part.Size.Y, part.Size.Z)
+                if largest > 0 and largest <= 12 then score = score + 40 end
+                if not part.Anchored then score = score + 20 end
+                if score > bestScore then best, bestScore = part, score end
+            end
+        end
+    end
+    VX.partCache[candidate] = best
+    return best
+end
+function VX.forget(v)
+    VX.set[v] = nil
+    VX.partCache[v] = nil
+end
+function VX.start()
+    if VX.on then return end
+    VX.on = true
+    VX.seedToken = VX.seedToken + 1
+    local token = VX.seedToken
+    VX.clear(VX.set)
+    VX.clear(VX.partCache)
+    -- Balls can be spawned inside replicated folders/models rather than directly
+    -- under Workspace. Track all future descendants and seed existing descendants
+    -- incrementally so discovery never blocks an input/receive frame.
+    local okAdd, addConn = pcall(function() return Workspace.DescendantAdded:Connect(VX.track) end)
+    local okRemove, removeConn = pcall(function() return Workspace.DescendantRemoving:Connect(VX.forget) end)
+    if okAdd and addConn then VX.conns[#VX.conns + 1] = addConn end
+    if okRemove and removeConn then VX.conns[#VX.conns + 1] = removeConn end
+    task.spawn(function()
+        local queue, head, visited = { Workspace }, 1, 0
+        while VX.on and token == VX.seedToken and queue[head] do
+            local parent = queue[head]
+            queue[head] = nil
+            head = head + 1
+            local children = parent:GetChildren()
+            for _, child in ipairs(children) do
+                VX.track(child)
+                if not child:IsA("BasePart") then queue[#queue + 1] = child end
+                visited = visited + 1
+                if visited % 180 == 0 then task.wait() end
+                if not VX.on or token ~= VX.seedToken then return end
+            end
+        end
+    end)
+end
+function VX.stop()
+    if not VX.on and #VX.conns == 0 then return end
+    VX.on = false
+    VX.seedToken = VX.seedToken + 1
+    for i = #VX.conns, 1, -1 do
+        pcall(VX.disconnect, VX.conns[i])
+        VX.conns[i] = nil
+    end
+    VX.clear(VX.set)
+    VX.clear(VX.partCache)
+end
+function VX.use(key, on)
+    local enabled = on == true
+    if VX.users[key] == enabled then return end
+    VX.users[key] = enabled or nil
+    if next(VX.users) then VX.start() else VX.stop() end
+end
+function VX.list()
+    VX.clear(VX.buf)
+    if not VX.on then
+        for _, v in ipairs(Workspace:GetChildren()) do
+            local n = v.Name
+            if type(n) == "string" and n:find("BALL", 1, true) then
+                VX.buf[#VX.buf + 1] = v
+            end
+        end
+        return VX.buf
+    end
+    for v in pairs(VX.set) do
+        if v and v:IsDescendantOf(Workspace) then
+            VX.buf[#VX.buf + 1] = v
+        else
+            VX.set[v] = nil
+            VX.partCache[v] = nil
+        end
+    end
+    return VX.buf
+end
+
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+    Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+    LocalPlayer = Players.LocalPlayer
+end
+
+if not LocalPlayer:FindFirstChild("PlayerGui") then
+    LocalPlayer:WaitForChild("PlayerGui", 10)
+end
+
+local ScriptVersion = "0.10"
+local ScriptName = "Uxosuim Hub"
+local LastUpdated = "22-10-2026"
+
+local UXOSUIM_UI_SOURCES = {
+    "https://raw.githubusercontent.com/VipRave/UXS/refs/heads/main/UXO.lua",
+}
+
+local function uxosuim_load_ui()
+    local preloaded, cachedBody = nil, nil
+    pcall(function()
+        if type(getgenv) == "function" then
+            preloaded = getgenv().UxosuimUIPreloaded
+            getgenv().UxosuimUIPreloaded = nil
+            cachedBody = getgenv().UxosuimUICodeCache
+        end
+    end)
+    if type(preloaded) == "table" and type(preloaded.Library) == "table" then
+        return preloaded
+    end
+    local problems = {}
+    local function compileUi(body, label)
+        if type(body) ~= "string" or body == "" then return nil, "empty UI source" end
+        local chunk, compileErr = loadstring(body, "@" .. tostring(label))
+        if not chunk then return nil, "SYNTAX ERROR: " .. tostring(compileErr) end
+        local ran, result = pcall(chunk)
+        if not ran then return nil, "runtime error: " .. tostring(result) end
+        if type(result) ~= "table" or type(result.Library) ~= "table" then
+            return nil, "returned " .. tostring(typeof and typeof(result) or type(result))
+        end
+        return result
+    end
+    -- Re-running after an unload uses verified UI source already held by the
+    -- executor session, avoiding another network request and reducing load time.
+    if type(cachedBody) == "string" and cachedBody ~= "" then
+        local cachedPack, cachedErr = compileUi(cachedBody, "UxosuimUICache")
+        if cachedPack then return cachedPack end
+        problems[#problems + 1] = "cached UI source\n      " .. tostring(cachedErr)
+        pcall(function() if getgenv then getgenv().UxosuimUICodeCache = nil end end)
+    end
+    for _, url in ipairs(UXOSUIM_UI_SOURCES) do
+        local ok, body = pcall(function() return game:HttpGet(url, true) end)
+        if not ok or type(body) ~= "string" or body == "" then
+            table.insert(problems, url .. "\n      download failed: " .. tostring(body))
+        elseif body:sub(1, 3) == "404" or body:match("^%s*<") then
+            table.insert(problems, url .. "\n      server returned: " .. body:sub(1, 60):gsub("%s+", " "))
+        else
+            local pack, issue = compileUi(body, "UxosuimUI")
+            if pack then
+                pcall(function() if getgenv then getgenv().UxosuimUICodeCache = body end end)
+                return pack
+            end
+            table.insert(problems, url .. "\n      " .. tostring(issue))
+        end
+    end
+    error("[Uxosuim] could not load UxosuimUI from any source:\n    " .. table.concat(problems, "\n    "), 0)
+end
+
+local pack = uxosuim_load_ui()
+local Library, ThemeManager, SaveManager = pack.Library, pack.ThemeManager, pack.SaveManager
+
+if getgenv then getgenv().UxosuimHubLoaded = true end
+if getgenv then getgenv().UxosuimHubLibrary = Library end
+
+local Options = Library.Options
+local Toggles = Library.Toggles
+
+Library.ForceCheckbox = false
+Library.ShowToggleFrameInKeybinds = true
+Library.ShowCustomCursor = false
+Library:SetNotifySide("Left")
+
+if type(newcclosure) ~= "function" then
+    newcclosure = function(fn) return fn end
+end
+
+local FeatureConfig = {
+    notifications = true,
+    notificationLifetime = 6,
+    hitboxMaxDistance = 120,
+    hitboxMaterial = Enum.Material.ForceField,
+    hitboxMaterialByName = {
+        ForceField = Enum.Material.ForceField,
+        Neon = Enum.Material.Neon,
+        SmoothPlastic = Enum.Material.SmoothPlastic,
+    },
+    jumpEspFillTransparency = 0.5,
+    jumpEspOutlineTransparency = 0,
+    jumpEspMaxDistance = 250,
+    jumpEspAlwaysOnTop = true,
+    predictAimThickness = 0.12,
+    predictAimTransparency = 0.15,
+    predictAimMaxDistance = 250,
+    cameraJumpCooldown = 0.06,
+    streamerHideSelf = false,
+    speedMaxStep = 2.5,
+    speedAllowAir = true,
+    autoSpinPauseInLobby = true,
+    autoSpinMaxFailures = 8,
+    autoSpinRunId = 0,
+    performanceLevel = "Balanced",
+    performanceYieldEvery = 320,
+}
+local notifySeen, notifySeenCount = {}, 0
+local function notify(message, lifetime)
+    if UxosuimUnloaded or not FeatureConfig.notifications then return end
+    local text = tostring(message)
+    local now = os.clock()
+    local seenAt = notifySeen[text]
+    if seenAt and now - seenAt < 1.25 then return end
+    if not seenAt then notifySeenCount = notifySeenCount + 1 end
+    notifySeen[text] = now
+    if notifySeenCount > 32 then
+        for key, at in pairs(notifySeen) do
+            if now - at >= 1.25 then
+                notifySeen[key] = nil
+                notifySeenCount = notifySeenCount - 1
+            end
+        end
+    end
+    pcall(function()
+        Library:Notify({
+            Title = "◈ Uxosuim Hub",
+            Description = text,
+            Time = math.clamp(tonumber(lifetime) or FeatureConfig.notificationLifetime, 1, 15),
+        })
+    end)
+end
+if getgenv then getgenv().UxosuimHubNotify = notify end
+
+local HitboxEnabled = false
+local HitboxSize = 10
+local HitboxColor = Color3.fromRGB(0, 255, 0)
+local HitboxTransparency = 0.8
+
+local JumpESPEnabled = false
+local JumpESPColor = Color3.fromRGB(255, 0, 0)
+
+local PredictAimEnabled = false
+local PredictAimColor = Color3.fromRGB(255, 255, 0)
+local PredictAimLength = 18
+
+local BallESP
+local isInLobbyCached
+
+local AutoStrongServeEveryServeEnabled = false
+local ServeBoostPower = 1
+local StreamerModeEnabled = false
+local DirectionalHitEnabled = false
+local CameraJumpEnabled = true
+local CameraJumpTurnTime = 0.018
+local CameraJumpMaxTurn = 180
+FeatureConfig.cameraJump = { pendingDirection = nil, pendingAt = 0, statusLabel = nil, lastStatus = "" }
+function FeatureConfig.setCameraJumpStatus(text)
+    text = tostring(text)
+    local state = FeatureConfig.cameraJump
+    if state.lastStatus == text then return end
+    state.lastStatus = text
+    pcall(function()
+        if state.statusLabel then state.statusLabel:SetText("State: " .. text) end
+    end)
+end
+local JumpBoostEnabled = false
+local JumpBoostMult = 3
+local ballInteractRemote = nil
+local streamerOriginalDisplay = {}
+
+-- Client-side visual effect reducer. It only changes local rendering properties
+-- and restores each original property when disabled or unloaded.
+FeatureConfig.performanceMode = {
+    enabled = false,
+    level = FeatureConfig.performanceLevel,
+    changed = {},
+    conns = {},
+    reduced = 0,
+    scanId = 0,
+    statusLabel = nil,
+}
+
+do
+local Lighting = game:GetService("Lighting")
+local function setPerformanceStatus(text)
+    pcall(function()
+        if FeatureConfig.performanceMode.statusLabel then
+            FeatureConfig.performanceMode.statusLabel:SetText("State: " .. tostring(text))
+        end
+    end)
+end
+
+local function isUxosuimPerformanceExcluded(instance)
+    local ownFolder = instance and instance:FindFirstAncestor("UxosuimBallESP")
+    return ownFolder ~= nil
+end
+
+local function performancePropertyFor(instance)
+    if not instance or isUxosuimPerformanceExcluded(instance) then return nil end
+    if instance:IsA("ParticleEmitter") or instance:IsA("Trail") or instance:IsA("Beam")
+        or instance:IsA("Smoke") or instance:IsA("Fire") or instance:IsA("Sparkles") then
+        return "Enabled"
+    end
+    if FeatureConfig.performanceMode.level ~= "Light" then
+        if instance:IsA("Light") or instance:IsA("PostEffect") then
+            return "Enabled"
+        end
+    end
+    if FeatureConfig.performanceMode.level == "Maximum" then
+        if instance:IsA("Atmosphere") or instance:IsA("Clouds") then
+            return "Density"
+        end
+    end
+    return nil
+end
+
+local function reducePerformanceInstance(instance)
+    if not FeatureConfig.performanceMode.enabled or FeatureConfig.performanceMode.changed[instance] then return end
+    local property = performancePropertyFor(instance)
+    if not property then return end
+    local okRead, previous = pcall(function() return instance[property] end)
+    if not okRead or previous == false or previous == 0 then return end
+    local replacement = property == "Density" and 0 or false
+    local okWrite = pcall(function() instance[property] = replacement end)
+    if okWrite then
+        FeatureConfig.performanceMode.changed[instance] = { property = property, value = previous }
+        FeatureConfig.performanceMode.reduced = FeatureConfig.performanceMode.reduced + 1
+    end
+end
+
+local function restorePerformanceMode()
+    FeatureConfig.performanceMode.scanId = FeatureConfig.performanceMode.scanId + 1
+    for instance, state in pairs(FeatureConfig.performanceMode.changed) do
+        pcall(function()
+            if instance and instance.Parent then instance[state.property] = state.value end
+        end)
+        FeatureConfig.performanceMode.changed[instance] = nil
+    end
+    FeatureConfig.performanceMode.reduced = 0
+end
+
+local function disconnectPerformanceMode()
+    for index = #FeatureConfig.performanceMode.conns, 1, -1 do
+        safeDisconnect(FeatureConfig.performanceMode.conns[index])
+        FeatureConfig.performanceMode.conns[index] = nil
+    end
+end
+
+local function scanPerformanceMode()
+    if not FeatureConfig.performanceMode.enabled then return end
+    FeatureConfig.performanceMode.scanId = FeatureConfig.performanceMode.scanId + 1
+    local scanId = FeatureConfig.performanceMode.scanId
+    setPerformanceStatus("ON — scanning local effects...")
+    task.spawn(function()
+        -- Use an incremental tree walk instead of one synchronous
+        -- GetDescendants allocation. Performance Mode remains responsive even
+        -- on large maps while every current and future local effect is covered.
+        local queue, head, checked = { Workspace, Lighting }, 1, 0
+        while queue[head] do
+            if not FeatureConfig.performanceMode.enabled or scanId ~= FeatureConfig.performanceMode.scanId or UxosuimUnloaded then return end
+            local parent = queue[head]
+            queue[head] = nil
+            head = head + 1
+            local ok, children = pcall(function() return parent:GetChildren() end)
+            if ok and type(children) == "table" then
+                for _, instance in ipairs(children) do
+                    if not FeatureConfig.performanceMode.enabled or scanId ~= FeatureConfig.performanceMode.scanId or UxosuimUnloaded then return end
+                    reducePerformanceInstance(instance)
+                    queue[#queue + 1] = instance
+                    checked = checked + 1
+                    if checked % (FeatureConfig.performanceYieldEvery or 320) == 0 then task.wait() end
+                end
+            end
+        end
+        if FeatureConfig.performanceMode.enabled and scanId == FeatureConfig.performanceMode.scanId then
+            setPerformanceStatus("ON — " .. tostring(FeatureConfig.performanceMode.reduced) .. " local effects reduced")
+        end
+    end)
+end
+
+local function connectPerformanceMode()
+    if #FeatureConfig.performanceMode.conns > 0 then return end
+    for _, root in ipairs({ Workspace, Lighting }) do
+        local ok, conn = pcall(function()
+            return root.DescendantAdded:Connect(function(instance)
+                if FeatureConfig.performanceMode.enabled then reducePerformanceInstance(instance) end
+            end)
+        end)
+        if ok and conn then FeatureConfig.performanceMode.conns[#FeatureConfig.performanceMode.conns + 1] = conn end
+    end
+end
+
+function FeatureConfig.performanceMode.setLevel(level)
+    if level ~= "Light" and level ~= "Balanced" and level ~= "Maximum" then level = "Balanced" end
+    if FeatureConfig.performanceMode.level == level then return end
+    FeatureConfig.performanceMode.level = level
+    FeatureConfig.performanceLevel = level
+    if FeatureConfig.performanceMode.enabled then
+        restorePerformanceMode()
+        scanPerformanceMode()
+    end
+end
+
+function FeatureConfig.performanceMode.setEnabled(enabled)
+    enabled = enabled == true
+    if FeatureConfig.performanceMode.enabled == enabled then
+        if enabled then scanPerformanceMode() else setPerformanceStatus("OFF") end
+        return
+    end
+    FeatureConfig.performanceMode.enabled = enabled
+    if enabled then
+        connectPerformanceMode()
+        scanPerformanceMode()
+    else
+        disconnectPerformanceMode()
+        restorePerformanceMode()
+        setPerformanceStatus("OFF — restored local effects")
+    end
+end
+end
+
+local KeyDetectorSetKey = "Q"
+local KeyDetectorJumpSetKey = "E"
+local KeyDetectorSetKeyCode = Enum.KeyCode.Q
+local KeyDetectorSetInputType = Enum.UserInputType.Keyboard
+local KeyDetectorJumpSetKeyCode = Enum.KeyCode.E
+local KeyDetectorJumpSetInputType = Enum.UserInputType.Keyboard
+local KeyDetectorSetLabel = nil
+local KeyDetectorJumpSetLabel = nil
+
+-- Shared virtual-input ownership prevents automated Set/JumpSet/Spike actions
+-- from leaving a key or mouse button held after overlapping feature actions,
+-- an error, a respawn, or an unload.
+FeatureConfig.inputSafety = { keys = {}, buttons = {} }
+function FeatureConfig.inputSafety.keyDown(vim, key)
+    local state = FeatureConfig.inputSafety
+    state.keys[key] = (state.keys[key] or 0) + 1
+    if state.keys[key] == 1 then vim:SendKeyEvent(true, key, false, game) end
+end
+function FeatureConfig.inputSafety.keyUp(vim, key)
+    local state = FeatureConfig.inputSafety
+    local count = math.max((state.keys[key] or 1) - 1, 0)
+    if count == 0 then
+        state.keys[key] = nil
+        vim:SendKeyEvent(false, key, false, game)
+    else
+        state.keys[key] = count
+    end
+end
+function FeatureConfig.inputSafety.buttonDown(vim, button)
+    local state = FeatureConfig.inputSafety
+    state.buttons[button] = (state.buttons[button] or 0) + 1
+    if state.buttons[button] == 1 then vim:SendMouseButtonEvent(0, 0, button, true, game, 1) end
+end
+function FeatureConfig.inputSafety.buttonUp(vim, button)
+    local state = FeatureConfig.inputSafety
+    local count = math.max((state.buttons[button] or 1) - 1, 0)
+    if count == 0 then
+        state.buttons[button] = nil
+        vim:SendMouseButtonEvent(0, 0, button, false, game, 1)
+    else
+        state.buttons[button] = count
+    end
+end
+function FeatureConfig.inputSafety.releaseAll()
+    local state = FeatureConfig.inputSafety
+    local vim = game:GetService("VirtualInputManager")
+    for key in pairs(state.keys) do pcall(function() vim:SendKeyEvent(false, key, false, game) end) end
+    for button in pairs(state.buttons) do pcall(function() vim:SendMouseButtonEvent(0, 0, button, false, game, 1) end) end
+    VX.clear(state.keys)
+    VX.clear(state.buttons)
+end
+-- Prevent automated input ownership from surviving a focus change or respawn.
+-- This applies to every native-input feature without changing its action logic.
+hubConn(UserInputService.WindowFocusReleased, function()
+    pcall(FeatureConfig.inputSafety.releaseAll)
+end)
+hubConn(LocalPlayer.CharacterAdded, function()
+    pcall(FeatureConfig.inputSafety.releaseAll)
+end)
+
+local function updateKeyDetectorLabels()
+    pcall(function()
+        if getgenv then
+            getgenv().UxosuimDetectedKeys = {
+                Set = KeyDetectorSetKey,
+                JumpSet = KeyDetectorJumpSetKey,
+                SetKeyCode = KeyDetectorSetKeyCode,
+                JumpSetKeyCode = KeyDetectorJumpSetKeyCode,
+                SetInputType = KeyDetectorSetInputType,
+                JumpSetInputType = KeyDetectorJumpSetInputType,
+            }
+            getgenv().UxosuimSetKey = KeyDetectorSetKey
+            getgenv().UxosuimJumpSetKey = KeyDetectorJumpSetKey
+        end
+    end)
+    pcall(function()
+        if KeyDetectorSetLabel then
+            KeyDetectorSetLabel:SetText("Set Key: [" .. tostring(KeyDetectorSetKey) .. "]")
+        end
+    end)
+    pcall(function()
+        if KeyDetectorJumpSetLabel then
+            KeyDetectorJumpSetLabel:SetText("JumpSet Key: [" .. tostring(KeyDetectorJumpSetKey) .. "]")
+        end
+    end)
+end
+
+local function stringToKeyInput(s)
+    local raw = tostring(s or "")
+    raw = raw:gsub("^%s+", ""):gsub("%s+$", "")
+    if raw == "" then return nil, nil, "" end
+    local up = string.upper(raw)
+    if up == "MB1" or up == "M1" or up == "MOUSEBUTTON1" or up == "LMB" or up == "MOUSE1" then
+        return Enum.KeyCode.Unknown, Enum.UserInputType.MouseButton1, "MouseButton1"
+    end
+    if up == "MB2" or up == "M2" or up == "MOUSEBUTTON2" or up == "RMB" or up == "MOUSE2" then
+        return Enum.KeyCode.Unknown, Enum.UserInputType.MouseButton2, "MouseButton2"
+    end
+    if up == "MB3" or up == "M3" or up == "MOUSEBUTTON3" or up == "MMB" or up == "MOUSE3" then
+        return Enum.KeyCode.Unknown, Enum.UserInputType.MouseButton3, "MouseButton3"
+    end
+    if up == "SPACEBAR" then up = "SPACE" end
+    if up == "CTRL" then up = "LEFTCONTROL" end
+    if up == "SHIFT" then up = "LEFTSHIFT" end
+    if up == "ALT" then up = "LEFTALT" end
+    local kc = nil
+    pcall(function()
+        for _, item in ipairs(Enum.KeyCode:GetEnumItems()) do
+            if string.upper(item.Name) == up then
+                kc = item
+                break
+            end
+        end
+    end)
+    if kc then
+        return kc, Enum.UserInputType.Keyboard, kc.Name
+    end
+    local it = nil
+    pcall(function()
+        for _, item in ipairs(Enum.UserInputType:GetEnumItems()) do
+            if string.upper(item.Name) == up then
+                it = item
+                break
+            end
+        end
+    end)
+    if it then
+        return Enum.KeyCode.Unknown, it, it.Name
+    end
+    return nil, nil, raw
+end
+
+local function pressDetectedMove(moveName, holdDuration, instantRelease)
+    if UxosuimUnloaded then return end
+    local VIM = game:GetService("VirtualInputManager")
+    -- Most manual/quick controls retain their normal short native hold. Auto
+    -- Receive explicitly requests instantRelease: down and up happen in the
+    -- same call with no delay/yield/held-key window.
+    local hold = instantRelease and 0 or math.clamp(tonumber(holdDuration) or 0.03, 0.015, 0.14)
+    local kc, it
+    if moveName == "JumpSet" then kc, it = KeyDetectorJumpSetKeyCode, KeyDetectorJumpSetInputType
+    else kc, it = KeyDetectorSetKeyCode, KeyDetectorSetInputType end
+    local sent = false
+    local ok = pcall(function()
+        if it == Enum.UserInputType.MouseButton1 or it == Enum.UserInputType.MouseButton2 or it == Enum.UserInputType.MouseButton3 then
+            local btn = 0
+            if it == Enum.UserInputType.MouseButton2 then btn = 1 elseif it == Enum.UserInputType.MouseButton3 then btn = 2 end
+            FeatureConfig.inputSafety.buttonDown(VIM, btn)
+            if instantRelease then
+                FeatureConfig.inputSafety.buttonUp(VIM, btn)
+            else
+                task.delay(hold, function()
+                    pcall(function() FeatureConfig.inputSafety.buttonUp(VIM, btn) end)
+                end)
+            end
+            sent = true
+        elseif kc and kc ~= Enum.KeyCode.Unknown then
+            FeatureConfig.inputSafety.keyDown(VIM, kc)
+            if instantRelease then
+                FeatureConfig.inputSafety.keyUp(VIM, kc)
+            else
+                task.delay(hold, function()
+                    pcall(function() FeatureConfig.inputSafety.keyUp(VIM, kc) end)
+                end)
+            end
+            sent = true
+        end
+    end)
+    return ok and sent
+end
+
+pcall(function()
+    if getgenv then
+        getgenv().UxosuimDetectedKeys = {
+            Set = KeyDetectorSetKey, JumpSet = KeyDetectorJumpSetKey,
+            SetKeyCode = KeyDetectorSetKeyCode, JumpSetKeyCode = KeyDetectorJumpSetKeyCode,
+            SetInputType = KeyDetectorSetInputType, JumpSetInputType = KeyDetectorJumpSetInputType,
+        }
+        getgenv().UxosuimGetSetKey = function() return KeyDetectorSetKey, KeyDetectorSetKeyCode, KeyDetectorSetInputType end
+        getgenv().UxosuimGetJumpSetKey = function() return KeyDetectorJumpSetKey, KeyDetectorJumpSetKeyCode, KeyDetectorJumpSetInputType end
+        getgenv().UxosuimPressSet = function() pressDetectedMove("Set") end
+        getgenv().UxosuimPressJumpSet = function() pressDetectedMove("JumpSet") end
+    end
+end)
+
+local AutoSpinEnabled = false
+local AutoSpinType = "Style"
+local AutoSpinSlot = 1
+local AutoSpinStopOnRarity = ""
+local AutoSpinUseLucky = true
+local AutoSpinReselectSlot = true
+local AutoSpinSpeed = 0.35
+local AutoSpinBusy = false
+local lastAutoSpin = 0
+local AutoSpinCount = 0
+local AutoSpinLimit = 0
+local AutoSpinStartedAt = 0
+local AutoSpinBackoff = 0
+local AutoSpinLastRarity = "--"
+local AutoSpinBestRarity, AutoSpinBestRank = "--", 0
+local RARITY_RANK = { Secret = 5, Godly = 4, Legendary = 3, Ultra = 2, Evo = 1 }
+local AutoSpinStatusLabel = nil
+local AutoSpinStatsLabel = nil
+local AutoSpinTargetLabel = nil
+FeatureConfig.autoSpinDiagnostics = { label = nil, lastError = "", ready = false, scans = 0 }
+local resetSpinFails = function() end
+local uninstallAutoSpinWatch = function() end
+
+local function autoSpinStatus(overrideState)
+    local state = overrideState
+    if not state and not AutoSpinEnabled then
+        state = "idle"
+    elseif not state and os.clock() < AutoSpinBackoff then
+        state = "cooling down"
+    elseif not state then
+        state = "spinning"
+    end
+    if AutoSpinStatusLabel then
+        pcall(function()
+            AutoSpinStatusLabel:SetText(string.format("State: %s  |  Spins: %d%s",
+                state, AutoSpinCount,
+                AutoSpinLimit > 0 and ("/" .. AutoSpinLimit) or ""))
+        end)
+    end
+    if AutoSpinStatsLabel then
+        local rate = 0
+        if AutoSpinStartedAt > 0 then
+            rate = AutoSpinCount / math.max((os.clock() - AutoSpinStartedAt) / 60, 1 / 60)
+        end
+        pcall(function()
+            AutoSpinStatsLabel:SetText(string.format("Last: %s  |  Best: %s  |  %.0f spins/min",
+                AutoSpinLastRarity, AutoSpinBestRarity, rate))
+        end)
+    end
+    if AutoSpinTargetLabel then
+        pcall(function()
+            AutoSpinTargetLabel:SetText(string.format("Target: %s slot %d  |  Lucky: %s",
+                AutoSpinType, AutoSpinSlot, AutoSpinUseLucky and "On" or "Off"))
+        end)
+    end
+end
+
+local styleRollRemote, abilityRollRemote = nil, nil
+local styleSelectSlot, abilitySelectSlot = nil, nil
+
+local SpeedEnabled = false
+local SpeedValue = 0
+
+local speedChar, speedHum, speedRoot = nil, nil, nil
+local function speedControl()
+    while SpeedEnabled and not UxosuimUnloaded do
+        local dt = RunService.RenderStepped:Wait()
+        local character = LocalPlayer.Character
+        if character ~= speedChar or not (speedRoot and speedRoot.Parent) then
+            speedChar, speedHum, speedRoot = character, nil, nil
+            if character then
+                speedHum = character:FindFirstChildOfClass("Humanoid")
+                speedRoot = character:FindFirstChild("HumanoidRootPart")
+            end
+        end
+        if speedHum and speedRoot and speedHum.Health > 0 and SpeedValue > 0 then
+            local state = speedHum:GetState()
+            local airborne = state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall
+            local moveDirection = speedHum.MoveDirection
+            if moveDirection.Magnitude > 0 and (FeatureConfig.speedAllowAir or not airborne) then
+                local step = math.clamp(SpeedValue * 6 * math.clamp(dt, 0, 0.15), 0, FeatureConfig.speedMaxStep)
+                if step > 0 then speedRoot.CFrame = speedRoot.CFrame + moveDirection.Unit * step end
+            end
+        end
+    end
+end
+
+local speedLoopOn = false
+startSpeedLoop = function()
+    if speedLoopOn or not SpeedEnabled then return end
+    speedLoopOn = true
+    task.spawn(function()
+        speedControl()
+        speedLoopOn = false
+    end)
+end
+
+local Camera = Workspace.CurrentCamera
+
+local AutoCorner = {
+    enabled = false,
+    side = "Auto",
+    reach = "All",
+    drift = nil,
+    steer = nil,
+    aimed = false,
+    maxBallDistance = 95,
+    smoothing = 12,
+    aimDrop = 0.35,
+    boundsCache = nil,
+    boundsCacheT = -10,
+    jumpConn = nil,
+}
+hubConn(Workspace:GetPropertyChangedSignal("CurrentCamera"), function()
+    Camera = Workspace.CurrentCamera
+    if BallESP and BallESP.folder and BallESP.folder.Parent and Camera then
+        pcall(function() BallESP.folder.Parent = Camera end)
+    end
+end)
+
+do
+local function getNearestBallPart()
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    local best, bestDist = nil, math.max(tonumber(AutoCorner.maxBallDistance) or 95, 10)
+    for _, v in ipairs(VX.list()) do
+        if string.find(string.upper(v.Name), "CLIENT_BALL", 1, true) then
+            local part = VX.ballPart(v)
+            if part then
+                local d = (part.Position - root.Position).Magnitude
+                if d < bestDist then
+                    bestDist = d
+                    best = part
+                end
+            end
+        end
+    end
+    return best
+end
+
+AutoCorner.physics = function()
+    local common = ReplicatedStorage:FindFirstChild("Common")
+    local mod = common and common:FindFirstChild("Physics")
+    if not mod then return nil end
+    local ok, resolved = pcall(require, mod)
+    if ok and type(resolved) == "table" then
+        return resolved
+    end
+    return nil
+end
+
+AutoCorner.bounds = function()
+    local now = os.clock()
+    local cached = AutoCorner.boundsCache
+    if cached and now - (AutoCorner.boundsCacheT or 0) < 0.5 then
+        return cached.center, cached.half, cached.surfaceY
+    end
+    local center, half, surfaceY
+    local physics = AutoCorner.physics()
+    if physics and physics._getCourtlines then
+        local found, lines = pcall(physics._getCourtlines)
+        if found and lines and lines:IsA("BasePart") then
+            center, half, surfaceY = lines.Position, lines.Size * 0.5, lines.Position.Y
+        end
+    end
+    if not center then
+        local map = Workspace:FindFirstChild("Map")
+        local court = map and map:FindFirstChild("Court")
+        if court then
+            center, half, surfaceY = court.Position, court.Size * 0.5 - Vector3.new(1, 0, 1), court.Position.Y + court.Size.Y * 0.5
+        end
+    end
+    center, half, surfaceY = center or Vector3.new(0, 0, 0), half or Vector3.new(22, 0, 36), surfaceY or 0
+    AutoCorner.boundsCache = { center = center, half = half, surfaceY = surfaceY }
+    AutoCorner.boundsCacheT = now
+    return center, half, surfaceY
+end
+
+AutoCorner.trackBall = function(ball, before, elapsed)
+    local shared = nil
+    if BallESP and BallESP.ball and BallESP.velocityOf then
+        local okV, v = pcall(BallESP.velocityOf, BallESP.ball)
+        if okV and typeof(v) == "Vector3" and v.Magnitude > 1 then shared = v end
+    end
+    if shared then
+        local prev = AutoCorner.drift
+        if typeof(prev) == "Vector3" then
+            AutoCorner.drift = prev:Lerp(shared, 0.5)
+        else
+            AutoCorner.drift = shared
+        end
+        return
+    end
+    if not ball or not ball.Parent or not before or elapsed <= 0 then return end
+    elapsed = math.clamp(elapsed, 0.005, 0.25)
+    local measured = (ball.Position - before) / elapsed
+    if measured.Magnitude <= 500 then AutoCorner.drift = measured end
+end
+
+AutoCorner.origin = function()
+    local ball = getNearestBallPart()
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not ball then
+        return root and root.Position or Vector3.zero
+    end
+    local drift = AutoCorner.drift
+    if not root or typeof(drift) ~= "Vector3" or drift.Magnitude < 1 then
+        return ball.Position
+    end
+    local gap = ball.Position - root.Position
+    local closing = drift - root.AssemblyLinearVelocity
+    local speed = closing:Dot(closing)
+    if speed < 1 then
+        return ball.Position
+    end
+    local reach = math.clamp(-gap:Dot(closing) / speed, 0, 0.45)
+    return ball.Position + drift * reach
+end
+
+local function cornerPoint()
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local centre, half, surfaceY = AutoCorner.bounds()
+    if not root or not centre then return nil end
+
+    local halfX = math.max(half.X - 2, 1)
+    local halfZ = math.max(half.Z - 2, 1)
+
+    local map = Workspace:FindFirstChild("Map")
+    local collide = map and map:FindFirstChild("BallCollideOnly")
+    local net = collide and collide:FindFirstChild("Net")
+    local netZ = net and net.Position.Z or centre.Z
+
+    local index = LocalPlayer.Team and LocalPlayer.Team:GetAttribute("Index")
+    local sign
+    if index == 1 then
+        sign = 1
+    elseif index == 2 then
+        sign = -1
+    else
+        sign = (root.Position.Z < netZ) and 1 or -1
+    end
+
+    local deepZ = centre.Z + sign * halfZ
+    local leftX = centre.X + sign * halfX
+    local rightX = centre.X - sign * halfX
+    local pivot = AutoCorner.origin()
+    local attackLine = half.Z / 3
+    local standoff = math.abs(root.Position.Z - netZ)
+    local hugging = 1 - math.clamp(standoff / math.max(attackLine, 1), 0, 1)
+    local shortZ = centre.Z + sign * halfZ * 0.3
+    local reach = AutoCorner.reach
+    local wantsNear = reach == "Nearest" or (reach ~= "Back" and hugging > 0)
+
+    if AutoCorner.side == "Left" then
+        return Vector3.new(leftX, surfaceY, wantsNear and shortZ or deepZ)
+    elseif AutoCorner.side == "Right" then
+        return Vector3.new(rightX, surfaceY, wantsNear and shortZ or deepZ)
+    end
+
+    local corners = {}
+    if reach ~= "Nearest" then
+        corners[#corners + 1] = { at = Vector3.new(leftX, surfaceY, deepZ), reward = 0 }
+        corners[#corners + 1] = { at = Vector3.new(rightX, surfaceY, deepZ), reward = 0 }
+    end
+    if wantsNear then
+        corners[#corners + 1] = { at = Vector3.new(leftX, surfaceY, shortZ), reward = 0.45 * hugging }
+        corners[#corners + 1] = { at = Vector3.new(rightX, surfaceY, shortZ), reward = 0.45 * hugging }
+    end
+    if #corners == 0 then return nil end
+
+    local eye = Workspace.CurrentCamera or Camera
+    local heading = eye and eye.CFrame.LookVector or root.CFrame.LookVector
+    heading = Vector3.new(heading.X, 0, heading.Z)
+    if heading.Magnitude < 0.01 then
+        return corners[1].at
+    end
+    heading = heading.Unit
+
+    local physics = AutoCorner.physics()
+    local bounds = nil
+    if physics and physics._getCourtlines then
+        local ok, lines = pcall(physics._getCourtlines)
+        if ok then bounds = lines end
+    end
+
+    local guards = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and (not LocalPlayer.Team or player.Team ~= LocalPlayer.Team) then
+            local gr = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+            if gr then
+                local lead = gr.AssemblyLinearVelocity * 0.45
+                guards[#guards + 1] = Vector3.new(gr.Position.X + lead.X, surfaceY, gr.Position.Z + lead.Z)
+            end
+        end
+    end
+
+    local aligned = {}
+    for _, corner in ipairs(corners) do
+        local legal = true
+        if bounds and physics and physics.isPositionInCourt then
+            local ok, inside = pcall(physics.isPositionInCourt, corner.at, bounds, 0, nil)
+            legal = not ok or inside
+        end
+        if legal then
+            local line = Vector3.new(corner.at.X - pivot.X, 0, corner.at.Z - pivot.Z)
+            if line.Magnitude > 0.01 then
+                aligned[#aligned + 1] = {
+                    spot = corner.at,
+                    dot = line.Unit:Dot(heading),
+                    reward = corner.reward,
+                }
+            end
+        end
+    end
+    if #aligned == 0 then return corners[1].at end
+
+    local pick
+    for _, entry in ipairs(aligned) do
+        if not pick or entry.dot > pick.dot then
+            pick = entry
+        end
+    end
+    local wanted = pick.spot.X >= centre.X
+
+    local best, bestScore
+    local sticky, stickyScore = AutoCorner.lastSpot, nil
+    for _, entry in ipairs(aligned) do
+        if (entry.spot.X >= centre.X) == wanted then
+            local nearest = 60
+            for _, guard in ipairs(guards) do
+                local gap = (guard - entry.spot).Magnitude
+                if gap < nearest then nearest = gap end
+            end
+            local score = math.min(nearest, 45) / 45 + entry.reward
+            if sticky and (entry.spot - sticky).Magnitude < 2 then
+                stickyScore = score
+            end
+            if not bestScore or score > bestScore then
+                bestScore = score
+                best = entry.spot
+            end
+        end
+    end
+    if sticky and stickyScore and bestScore and stickyScore > bestScore - 0.12 then
+        best, bestScore = sticky, stickyScore
+    end
+    best = best or pick.spot
+    AutoCorner.lastSpot = best
+    return best
+end
+
+AutoCorner.facing = function()
+    local spot = cornerPoint()
+    if not spot then return nil end
+    local pivot = AutoCorner.origin()
+    local flat = Vector3.new(spot.X - pivot.X, 0, spot.Z - pivot.Z)
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if root then
+        local map = Workspace:FindFirstChild("Map")
+        local collide = map and map:FindFirstChild("BallCollideOnly")
+        local net = collide and collide:FindFirstChild("Net")
+        local netZ = net and net.Position.Z
+        if netZ then
+            local ownSide = (root.Position.Z > netZ) and 1 or -1
+            if flat.Z * ownSide >= 0 then
+                flat = Vector3.new(spot.X - root.Position.X, 0, spot.Z - root.Position.Z)
+            end
+            if flat.Z * ownSide >= 0 then
+                flat = Vector3.new(flat.X, 0, -ownSide * math.max(math.abs(flat.Z), 1))
+            end
+        end
+    end
+    if flat.Magnitude < 0.01 then return nil end
+    return flat.Unit
+end
+
+AutoCorner.refresh = function()
+    if not AutoCorner.enabled or UxosuimUnloaded then return end
+    local nowA = os.clock()
+    local prevT = AutoCorner.refreshT or nowA
+    -- Fixed at the fastest safe cadence: once per Heartbeat/frame.
+    local dt = math.clamp(nowA - prevT, 1 / 240, 0.25)
+    AutoCorner.refreshT = nowA
+
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum then return end
+
+    local state = hum:GetState()
+    local airborne = state == Enum.HumanoidStateType.Jumping
+        or state == Enum.HumanoidStateType.Freefall
+        or root.AssemblyLinearVelocity.Y > 3
+    if not airborne then
+        AutoCorner.lastSpot = nil
+        return
+    end
+
+    AutoCorner.trackBall(nil, nil, 0)
+
+    local want = AutoCorner.facing()
+    if not want or want.Magnitude < 0.01 then return end
+    local cur = AutoCorner.steer
+    if typeof(cur) == "Vector3" and cur.Magnitude > 0.01 then
+        local blended = cur:Lerp(want, 1 - math.exp(-math.clamp(tonumber(AutoCorner.smoothing) or 12, 1, 30) * dt))
+        if blended.Magnitude > 0.01 then
+            AutoCorner.steer = blended.Unit
+        end
+    else
+        AutoCorner.steer = want
+    end
+end
+
+AutoCorner.installAim = function()
+    if AutoCorner.aimed then return true end
+    if not (getrawmetatable and setreadonly and getnamecallmethod) then return false end
+    if not ballInteractRemote then
+        pcall(function()
+            local services = ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"].knit.Services
+            local bs = services:FindFirstChild("BallService")
+            local rf = bs and bs:FindFirstChild("RF")
+            ballInteractRemote = rf and rf:FindFirstChild("Interact")
+        end)
+    end
+    if not ballInteractRemote then
+        warn("[UxosuimHub] AutoCorner: Interact remote missing")
+        return false
+    end
+    local mt = getrawmetatable(game)
+    local oldNamecall = mt.__namecall
+    setreadonly(mt, false)
+    mt.__namecall = newcclosure(function(self, ...)
+        if UxosuimUnloaded then return oldNamecall(self, ...) end
+        local method = getnamecallmethod()
+        if self == ballInteractRemote and method == "InvokeServer" then
+            local data = ...
+            if AutoCorner.enabled and type(data) == "table" and (data.Move == "Spike" or data.Move == "ServeSpike") then
+                -- Keep this native action path minimal. The best corner/facing
+                -- is prepared on the regular update path; do not resolve court
+                -- data or run extra target work inside a manual ball interaction.
+                local steer = AutoCorner.steer
+                if typeof(steer) == "Vector3" then
+                    local flat = Vector3.new(steer.X, 0, steer.Z)
+                    if flat.Magnitude > 0.01 then
+                        flat = flat.Unit
+                        local aim = (flat - Vector3.new(0, math.clamp(tonumber(AutoCorner.aimDrop) or 0.35, 0, 1.5), 0)).Unit
+                        data.LookVector = aim
+                        data.Direction = aim
+                    end
+                end
+            end
+            return oldNamecall(self, data)
+        end
+        return oldNamecall(self, ...)
+    end)
+    setreadonly(mt, true)
+    AutoCorner._oldNamecall = oldNamecall
+    AutoCorner.aimed = true
+    return true
+end
+
+AutoCorner.uninstallAim = function()
+    if not AutoCorner.aimed then return end
+    AutoCorner.aimed = false
+    AutoCorner.steer = nil
+    pcall(function()
+        local mt = getrawmetatable(game)
+        setreadonly(mt, false)
+        mt.__namecall = AutoCorner._oldNamecall
+        setreadonly(mt, true)
+    end)
+end
+
+local function bindAutoCornerJump(character)
+    safeDisconnect(AutoCorner.jumpConn)
+    AutoCorner.jumpConn = nil
+    local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5)
+    local rootPart = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 5)
+    if not humanoid or not rootPart then return end
+    AutoCorner.jumpConn = humanoid:GetPropertyChangedSignal("Jump"):Connect(function()
+        if not humanoid.Jump then return end
+        if AutoCorner.enabled then
+            task.defer(function()
+                local tracked = getNearestBallPart()
+                local before = tracked and tracked.Position
+                local stamp = os.clock()
+                task.wait(0.03)
+                if tracked and before and tracked.Parent then
+                    AutoCorner.trackBall(tracked, before, os.clock() - stamp)
+                end
+                local lookVector = AutoCorner.facing()
+                if lookVector and lookVector.Magnitude > 0 then
+                    AutoCorner.steer = lookVector
+                    rootPart.CFrame = CFrame.lookAt(rootPart.Position, rootPart.Position + lookVector)
+                end
+            end)
+            return
+        end
+    end)
+end
+
+if LocalPlayer.Character then
+    task.spawn(bindAutoCornerJump, LocalPlayer.Character)
+end
+hubConn(LocalPlayer.CharacterAdded, bindAutoCornerJump)
+
+local lastCameraJumpTurn = 0
+local cameraTurnToken = 0
+
+local function cameraJumpSnapshot()
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local look = cam.CFrame.LookVector
+    local flat = Vector3.new(look.X, 0, look.Z)
+    if flat.Magnitude < 0.05 then return nil end
+    return flat.Unit
+end
+
+local function cameraJumpTurn(rootPart, targetDir, duration)
+    if not rootPart or not rootPart.Parent then return end
+    cameraTurnToken = cameraTurnToken + 1
+    local token = cameraTurnToken
+    duration = math.clamp(tonumber(duration) or 0.018, 0.005, 0.6)
+    if typeof(targetDir) ~= "Vector3" or targetDir.Magnitude < 0.01 then return end
+    local targetYaw = math.atan2(-targetDir.X, -targetDir.Z)
+    local cur = rootPart.CFrame.LookVector
+    local startYaw = math.atan2(-cur.X, -cur.Z)
+    local diff = (targetYaw - startYaw + math.pi) % (math.pi * 2) - math.pi
+    local maxRad = math.rad(math.clamp(CameraJumpMaxTurn, 10, 180))
+    if diff > maxRad then diff = maxRad elseif diff < -maxRad then diff = -maxRad end
+    if math.abs(diff) < math.rad(1) then return end
+    FeatureConfig.setCameraJumpStatus("Turning " .. tostring(math.floor(math.abs(math.deg(diff)) + 0.5)) .. "°")
+    if duration <= 0.008 then
+        pcall(function() rootPart.CFrame = CFrame.new(rootPart.Position) * CFrame.Angles(0, startYaw + diff, 0) end)
+        FeatureConfig.setCameraJumpStatus("Aligned")
+        return
+    end
+    local t0 = os.clock()
+    while true do
+        if token ~= cameraTurnToken then return end
+        if not CameraJumpEnabled or AutoCorner.enabled or UxosuimUnloaded then return end
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not char or not rootPart.Parent or not hum or hum.Health <= 0 then return end
+        local k = math.clamp((os.clock() - t0) / duration, 0, 1)
+        local e = k * k * (3 - 2 * k)
+        local yaw = startYaw + diff * e
+        pcall(function()
+            rootPart.CFrame = CFrame.new(rootPart.Position) * CFrame.Angles(0, yaw, 0)
+        end)
+        if k >= 1 then
+            FeatureConfig.setCameraJumpStatus("Aligned")
+            return
+        end
+        RunService.Heartbeat:Wait()
+    end
+end
+
+local function tryCameraJump(preferredDirection)
+    if not CameraJumpEnabled then return end
+    if AutoCorner.enabled then return end
+    if UxosuimUnloaded then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local rootPart = char:FindFirstChild("HumanoidRootPart")
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not rootPart or not humanoid or humanoid.Health <= 0 then return end
+    if os.clock() - lastCameraJumpTurn < math.clamp(tonumber(FeatureConfig.cameraJumpCooldown) or 0.06, 0.02, 2) then return end
+    local pending = FeatureConfig.cameraJump
+    local dir = preferredDirection
+    if not dir and os.clock() - (pending.pendingAt or 0) <= 0.18 then dir = pending.pendingDirection end
+    dir = dir or cameraJumpSnapshot()
+    if not dir then return end
+    pending.pendingDirection, pending.pendingAt = nil, 0
+    lastCameraJumpTurn = os.clock()
+    task.spawn(cameraJumpTurn, rootPart, dir, CameraJumpTurnTime... (204 KB left)
